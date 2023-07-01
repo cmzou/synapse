@@ -247,9 +247,6 @@ class ExperimentalConfig(Config):
         # MSC3026 (busy presence state)
         self.msc3026_enabled: bool = experimental.get("msc3026_enabled", False)
 
-        # MSC2716 (importing historical messages)
-        self.msc2716_enabled: bool = experimental.get("msc2716_enabled", False)
-
         # MSC3244 (room version capabilities)
         self.msc3244_enabled: bool = experimental.get("msc3244_enabled", True)
 
@@ -357,11 +354,6 @@ class ExperimentalConfig(Config):
 
         # MSC3391: Removing account data.
         self.msc3391_enabled = experimental.get("msc3391_enabled", False)
-
-        # MSC3952: Intentional mentions, this depends on MSC3966.
-        self.msc3952_intentional_mentions = experimental.get(
-            "msc3952_intentional_mentions", False
-        )
 
         # MSC3959: Do not generate notifications for edits.
         self.msc3958_supress_edit_notifs = experimental.get(

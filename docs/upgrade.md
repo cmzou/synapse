@@ -87,6 +87,43 @@ process, for example:
     wget https://packages.matrix.org/debian/pool/main/m/matrix-synapse-py3/matrix-synapse-py3_1.3.0+stretch1_amd64.deb
     dpkg -i matrix-synapse-py3_1.3.0+stretch1_amd64.deb
     ```
+
+# Upgrading to v1.89.0
+
+## Removal of unspecced `user` property for `/register`
+
+Application services can no longer call `/register` with a `user` property to create new users.
+The standard `username` property should be used instead. See the
+[Application Service specification](https://spec.matrix.org/v1.7/application-service-api/#server-admin-style-permissions)
+for more information.
+
+
+# Upgrading to v1.88.0
+
+## Minimum supported Python version
+
+The minimum supported Python version has been increased from v3.7 to v3.8.
+You will need Python 3.8 to run Synapse v1.88.0 (due out July 18th, 2023).
+
+If you use current versions of the Matrix.org-distributed Debian
+packages or Docker images, no action is required.
+
+## Removal of `worker_replication_*` settings
+
+As mentioned previously in [Upgrading to v1.84.0](#upgrading-to-v1840), the following deprecated settings
+are being removed in this release of Synapse:
+
+* [`worker_replication_host`](https://matrix-org.github.io/synapse/v1.86/usage/configuration/config_documentation.html#worker_replication_host)
+* [`worker_replication_http_port`](https://matrix-org.github.io/synapse/v1.86/usage/configuration/config_documentation.html#worker_replication_http_port)
+* [`worker_replication_http_tls`](https://matrix-org.github.io/synapse/v1.86/usage/configuration/config_documentation.html#worker_replication_http_tls)
+
+Please ensure that you have migrated to using `main` on your shared configuration's `instance_map`
+(or create one if necessary). This is required if you have ***any*** workers at all;
+administrators of single-process (monolith) installations don't need to do anything.
+
+For an illustrative example, please see [Upgrading to v1.84.0](#upgrading-to-v1840) below.
+
+
 # Upgrading to v1.86.0
 
 ## Minimum supported Rust version

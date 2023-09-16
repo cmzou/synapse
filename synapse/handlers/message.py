@@ -53,6 +53,7 @@ from synapse.events.snapshot import EventContext, UnpersistedEventContextBase
 from synapse.events.utils import SerializeEventConfig, maybe_upsert_event_field
 from synapse.events.validator import EventValidator
 from synapse.handlers.directory import DirectoryHandler
+from synapse.handlers.worker_lock import NEW_EVENT_DURING_PURGE_LOCK_NAME
 from synapse.logging import opentracing
 from synapse.logging.context import make_deferred_yieldable, run_in_background
 from synapse.metrics.background_process_metrics import run_as_background_process
@@ -378,7 +379,7 @@ class MessageHandler:
         """
 
         expiry_ts = event.content.get(EventContentFields.SELF_DESTRUCT_AFTER)
-        if type(expiry_ts) is not int or event.is_state():
+        if type(expiry_ts) is not int or event.is_state():  # noqa: E721
             return
 
         # _schedule_expiry_for_event won't actually schedule anything if there's already
@@ -485,6 +486,7 @@ class EventCreationHandler:
         self._events_shard_config = self.config.worker.events_shard_config
         self._instance_name = hs.get_instance_name()
         self._notifier = hs.get_notifier()
+        self._worker_lock_handler = hs.get_worker_locks_handler()
 
         self.room_prejoin_state_types = self.hs.config.api.room_prejoin_state
 
@@ -558,8 +560,6 @@ class EventCreationHandler:
                 self.clock,
                 expiry_ms=30 * 60 * 1000,
             )
-
-        self._msc3970_enabled = hs.config.experimental.msc3970_enabled
 
     async def create_event(
         self,
@@ -828,13 +828,13 @@ class EventCreationHandler:
 
         u = await self.store.get_user_by_id(user_id)
         assert u is not None
-        if u["user_type"] in (UserTypes.SUPPORT, UserTypes.BOT):
+        if u.user_type in (UserTypes.SUPPORT, UserTypes.BOT):
             # support and bot users are not required to consent
             return
-        if u["appservice_id"] is not None:
+        if u.appservice_id is not None:
             # users registered by an appservice are exempt
             return
-        if u["consent_version"] == self.config.consent.user_consent_version:
+        if u.consent_version == self.config.consent.user_consent_version:
             return
 
         consent_uri = self._consent_uri_builder.build_user_consent_uri(user.localpart)
@@ -876,6 +876,40 @@ class EventCreationHandler:
                 return prev_event
         return None
 
+    async def get_event_id_from_transaction(
+        self,
+        requester: Requester,
+        txn_id: str,
+        room_id: str,
+    ) -> Optional[str]:
+        """For the given transaction ID and room ID, check if there is a matching event ID.
+
+        Args:
+            requester: The requester making the request in the context of which we want
+                to fetch the event.
+            txn_id: The transaction ID.
+            room_id: The room ID.
+
+        Returns:
+            An event ID if one could be found, None otherwise.
+        """
+        existing_event_id = None
+
+        # According to the spec, transactions are scoped to a user's device ID.
+        if requester.device_id:
+            existing_event_id = (
+                await self.store.get_event_id_from_transaction_id_and_device_id(
+                    room_id,
+                    requester.user.to_string(),
+                    requester.device_id,
+                    txn_id,
+                )
+            )
+            if existing_event_id:
+                return existing_event_id
+
+        return existing_event_id
+
     async def get_event_from_transaction(
         self,
         requester: Requester,
@@ -894,35 +928,11 @@ class EventCreationHandler:
         Returns:
             An event if one could be found, None otherwise.
         """
-
-        if self._msc3970_enabled and requester.device_id:
-            # When MSC3970 is enabled, we lookup for events sent by the same device first,
-            # and fallback to the old behaviour if none were found.
-            existing_event_id = (
-                await self.store.get_event_id_from_transaction_id_and_device_id(
-                    room_id,
-                    requester.user.to_string(),
-                    requester.device_id,
-                    txn_id,
-                )
-            )
-            if existing_event_id:
-                return await self.store.get_event(existing_event_id)
-
-        # Pre-MSC3970, we looked up for events that were sent by the same session by
-        # using the access token ID.
-        if requester.access_token_id:
-            existing_event_id = (
-                await self.store.get_event_id_from_transaction_id_and_token_id(
-                    room_id,
-                    requester.user.to_string(),
-                    requester.access_token_id,
-                    txn_id,
-                )
-            )
-            if existing_event_id:
-                return await self.store.get_event(existing_event_id)
-
+        existing_event_id = await self.get_event_id_from_transaction(
+            requester, txn_id, room_id
+        )
+        if existing_event_id:
+            return await self.store.get_event(existing_event_id)
         return None
 
     async def create_and_send_nonmember_event(
@@ -1009,6 +1019,37 @@ class EventCreationHandler:
                         event,
                         event.internal_metadata.stream_ordering,
                     )
+
+        async with self._worker_lock_handler.acquire_read_write_lock(
+            NEW_EVENT_DURING_PURGE_LOCK_NAME, room_id, write=False
+        ):
+            return await self._create_and_send_nonmember_event_locked(
+                requester=requester,
+                event_dict=event_dict,
+                allow_no_prev_events=allow_no_prev_events,
+                prev_event_ids=prev_event_ids,
+                state_event_ids=state_event_ids,
+                ratelimit=ratelimit,
+                txn_id=txn_id,
+                ignore_shadow_ban=ignore_shadow_ban,
+                outlier=outlier,
+                depth=depth,
+            )
+
+    async def _create_and_send_nonmember_event_locked(
+        self,
+        requester: Requester,
+        event_dict: dict,
+        allow_no_prev_events: bool = False,
+        prev_event_ids: Optional[List[str]] = None,
+        state_event_ids: Optional[List[str]] = None,
+        ratelimit: bool = True,
+        txn_id: Optional[str] = None,
+        ignore_shadow_ban: bool = False,
+        outlier: bool = False,
+        depth: Optional[int] = None,
+    ) -> Tuple[EventBase, int]:
+        room_id = event_dict["room_id"]
 
         # If we don't have any prev event IDs specified then we need to
         # check that the host is in the room (as otherwise populating the
@@ -1420,23 +1461,23 @@ class EventCreationHandler:
 
         # We now persist the event (and update the cache in parallel, since we
         # don't want to block on it).
-        event, context = events_and_context[0]
+        #
+        # Note: mypy gets confused if we inline dl and check with twisted#11770.
+        # Some kind of bug in mypy's deduction?
+        deferreds = (
+            run_in_background(
+                self._persist_events,
+                requester=requester,
+                events_and_context=events_and_context,
+                ratelimit=ratelimit,
+                extra_users=extra_users,
+            ),
+            run_in_background(
+                self.cache_joined_hosts_for_events, events_and_context
+            ).addErrback(log_failure, "cache_joined_hosts_for_event failed"),
+        )
         result, _ = await make_deferred_yieldable(
-            gather_results(
-                (
-                    run_in_background(
-                        self._persist_events,
-                        requester=requester,
-                        events_and_context=events_and_context,
-                        ratelimit=ratelimit,
-                        extra_users=extra_users,
-                    ),
-                    run_in_background(
-                        self.cache_joined_hosts_for_events, events_and_context
-                    ).addErrback(log_failure, "cache_joined_hosts_for_event failed"),
-                ),
-                consumeErrors=True,
-            )
+            gather_results(deferreds, consumeErrors=True)
         ).addErrback(unwrapFirstError)
 
         return result
@@ -1867,7 +1908,10 @@ class EventCreationHandler:
                 # We don't want to block sending messages on any presence code. This
                 # matters as sometimes presence code can take a while.
                 run_as_background_process(
-                    "bump_presence_active_time", self._bump_active_time, requester.user
+                    "bump_presence_active_time",
+                    self._bump_active_time,
+                    requester.user,
+                    requester.device_id,
                 )
 
         async def _notify() -> None:
@@ -1904,10 +1948,10 @@ class EventCreationHandler:
         logger.info("maybe_kick_guest_users %r", current_state)
         await self.hs.get_room_member_handler().kick_guest_users(current_state)
 
-    async def _bump_active_time(self, user: UserID) -> None:
+    async def _bump_active_time(self, user: UserID, device_id: Optional[str]) -> None:
         try:
             presence = self.hs.get_presence_handler()
-            await presence.bump_presence_active_time(user)
+            await presence.bump_presence_active_time(user, device_id)
         except Exception:
             logger.exception("Error bumping presence active time")
 
@@ -1923,7 +1967,10 @@ class EventCreationHandler:
         )
 
         for room_id in room_ids:
-            dummy_event_sent = await self._send_dummy_event_for_room(room_id)
+            async with self._worker_lock_handler.acquire_read_write_lock(
+                NEW_EVENT_DURING_PURGE_LOCK_NAME, room_id, write=False
+            ):
+                dummy_event_sent = await self._send_dummy_event_for_room(room_id)
 
             if not dummy_event_sent:
                 # Did not find a valid user in the room, so remove from future attempts

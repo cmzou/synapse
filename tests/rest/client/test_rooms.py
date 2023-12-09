@@ -888,7 +888,8 @@ class RoomsCreateTestCase(RoomBase):
     )
     def test_room_creation_ratelimiting(self) -> None:
         """
-        Regression test for #14312, where ratelimiting was made too strict.
+        Regression test for https://github.com/matrix-org/synapse/issues/14312,
+        where ratelimiting was made too strict.
         Clients should be able to create 10 rooms in a row
         without hitting rate limits, using default rate limit config.
         (We override rate limiting config back to its default value.)
@@ -1440,6 +1441,30 @@ class RoomJoinRatelimitTestCase(RoomBase):
             self.helper.join(room_id, joiner_user_id)
 
         # But the user cannot join a 4th room
+        self.helper.join(
+            room_ids[3], joiner_user_id, expect_code=HTTPStatus.TOO_MANY_REQUESTS
+        )
+
+    @unittest.override_config(
+        {"rc_joins": {"local": {"per_second": 0.5, "burst_count": 3}}}
+    )
+    def test_join_attempts_local_ratelimit(self) -> None:
+        """Tests that unsuccessful joins that end up being denied are rate-limited."""
+        # Create 4 rooms
+        room_ids = [
+            self.helper.create_room_as(self.user_id, is_public=True) for _ in range(4)
+        ]
+        # Pre-emptively ban the user who will attempt to join.
+        joiner_user_id = self.register_user("joiner", "secret")
+        for room_id in room_ids:
+            self.helper.ban(room_id, self.user_id, joiner_user_id)
+
+        # Now make a new user try to join some of them.
+        # The user can make 3 requests, each of which should be denied.
+        for room_id in room_ids[0:3]:
+            self.helper.join(room_id, joiner_user_id, expect_code=HTTPStatus.FORBIDDEN)
+
+        # The fourth attempt should be rate limited.
         self.helper.join(
             room_ids[3], joiner_user_id, expect_code=HTTPStatus.TOO_MANY_REQUESTS
         )

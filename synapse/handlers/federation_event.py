@@ -88,7 +88,7 @@ from synapse.types import (
 )
 from synapse.types.state import StateFilter
 from synapse.util.async_helpers import Linearizer, concurrently_execute
-from synapse.util.iterutils import batch_iter, partition
+from synapse.util.iterutils import batch_iter, partition, sorted_topologically_batched
 from synapse.util.retryutils import NotRetryingDestination
 from synapse.util.stringutils import shortstr
 
@@ -723,12 +723,11 @@ class FederationEventHandler:
         if not prevs - seen:
             return
 
-        latest_list = await self._store.get_latest_event_ids_in_room(room_id)
+        latest_frozen = await self._store.get_latest_event_ids_in_room(room_id)
 
         # We add the prev events that we have seen to the latest
         # list to ensure the remote server doesn't give them to us
-        latest = set(latest_list)
-        latest |= seen
+        latest = seen | latest_frozen
 
         logger.info(
             "Requesting missing events between %s and %s",
@@ -749,7 +748,7 @@ class FederationEventHandler:
         # fetching fresh state for the room if the missing event
         # can't be found, which slightly reduces our security.
         # it may also increase our DAG extremity count for the room,
-        # causing additional state resolution?  See #1760.
+        # causing additional state resolution?  See https://github.com/matrix-org/synapse/issues/1760.
         # However, fetching state doesn't hold the linearizer lock
         # apparently.
         #
@@ -1539,7 +1538,7 @@ class FederationEventHandler:
             logger.exception("Failed to resync device for %s", sender)
 
     async def backfill_event_id(
-        self, destinations: List[str], room_id: str, event_id: str
+        self, destinations: StrCollection, room_id: str, event_id: str
     ) -> PulledPduInfo:
         """Backfill a single event and persist it as a non-outlier which means
         we also pull in all of the state and auth events necessary for it.
@@ -1670,14 +1669,13 @@ class FederationEventHandler:
 
         # XXX: it might be possible to kick this process off in parallel with fetching
         # the events.
-        while event_map:
-            # build a list of events whose auth events are not in the queue.
-            roots = tuple(
-                ev
-                for ev in event_map.values()
-                if not any(aid in event_map for aid in ev.auth_event_ids())
-            )
 
+        # We need to persist an event's auth events before the event.
+        auth_graph = {
+            ev: [event_map[e_id] for e_id in ev.auth_event_ids() if e_id in event_map]
+            for ev in event_map.values()
+        }
+        for roots in sorted_topologically_batched(event_map.values(), auth_graph):
             if not roots:
                 # if *none* of the remaining events are ready, that means
                 # we have a loop. This either means a bug in our logic, or that
@@ -1698,9 +1696,6 @@ class FederationEventHandler:
             )
 
             await self._auth_and_persist_outliers_inner(room_id, roots)
-
-            for ev in roots:
-                del event_map[ev.event_id]
 
     async def _auth_and_persist_outliers_inner(
         self, room_id: str, fetched_events: Collection[EventBase]
@@ -1976,8 +1971,7 @@ class FederationEventHandler:
             # partial and full state and may not be accurate.
             return
 
-        extrem_ids_list = await self._store.get_latest_event_ids_in_room(event.room_id)
-        extrem_ids = set(extrem_ids_list)
+        extrem_ids = await self._store.get_latest_event_ids_in_room(event.room_id)
         prev_event_ids = set(event.prev_event_ids())
 
         if extrem_ids == prev_event_ids:
@@ -2343,6 +2337,12 @@ class FederationEventHandler:
         if event.type == EventTypes.Member and event.membership == Membership.JOIN:
             # TODO retrieve the previous state, and exclude join -> join transitions
             self._notifier.notify_user_joined_room(event.event_id, event.room_id)
+
+        # If this is a server ACL event, clear the cache in the storage controller.
+        if event.type == EventTypes.ServerACL:
+            self._state_storage_controller.get_server_acl_for_room.invalidate(
+                (event.room_id,)
+            )
 
     def _sanity_check_event(self, ev: EventBase) -> None:
         """

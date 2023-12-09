@@ -21,6 +21,7 @@ from typing import (
     TYPE_CHECKING,
     AbstractSet,
     Awaitable,
+    BinaryIO,
     Callable,
     Collection,
     Container,
@@ -64,7 +65,7 @@ from synapse.federation.transport.client import SendJoinResponse
 from synapse.http.client import is_unknown_endpoint
 from synapse.http.types import QueryParams
 from synapse.logging.opentracing import SynapseTags, log_kv, set_tag, tag_args, trace
-from synapse.types import JsonDict, UserID, get_domain_from_id
+from synapse.types import JsonDict, StrCollection, UserID, get_domain_from_id
 from synapse.util.async_helpers import concurrently_execute
 from synapse.util.caches.expiringcache import ExpiringCache
 from synapse.util.retryutils import NotRetryingDestination
@@ -1402,7 +1403,7 @@ class FederationClient(FederationBase):
             The remote homeserver return some state from the room. The response
             dictionary is in the form:
 
-            {"knock_state_events": [<state event dict>, ...]}
+            {"knock_room_state": [<state event dict>, ...]}
 
             The list of state events may be empty.
 
@@ -1429,7 +1430,7 @@ class FederationClient(FederationBase):
             The remote homeserver can optionally return some state from the room. The response
             dictionary is in the form:
 
-            {"knock_state_events": [<state event dict>, ...]}
+            {"knock_room_state": [<state event dict>, ...]}
 
             The list of state events may be empty.
         """
@@ -1704,7 +1705,7 @@ class FederationClient(FederationBase):
     async def timestamp_to_event(
         self,
         *,
-        destinations: List[str],
+        destinations: StrCollection,
         room_id: str,
         timestamp: int,
         direction: Direction,
@@ -1861,6 +1862,43 @@ class FederationClient(FederationBase):
         filtered_failures = list(filter(filter_user_id, failures))
 
         return filtered_statuses, filtered_failures
+
+    async def download_media(
+        self,
+        destination: str,
+        media_id: str,
+        output_stream: BinaryIO,
+        max_size: int,
+        max_timeout_ms: int,
+    ) -> Tuple[int, Dict[bytes, List[bytes]]]:
+        try:
+            return await self.transport_layer.download_media_v3(
+                destination,
+                media_id,
+                output_stream=output_stream,
+                max_size=max_size,
+                max_timeout_ms=max_timeout_ms,
+            )
+        except HttpResponseException as e:
+            # If an error is received that is due to an unrecognised endpoint,
+            # fallback to the r0 endpoint. Otherwise, consider it a legitimate error
+            # and raise.
+            if not is_unknown_endpoint(e):
+                raise
+
+        logger.debug(
+            "Couldn't download media %s/%s with the v3 API, falling back to the r0 API",
+            destination,
+            media_id,
+        )
+
+        return await self.transport_layer.download_media_r0(
+            destination,
+            media_id,
+            output_stream=output_stream,
+            max_size=max_size,
+            max_timeout_ms=max_timeout_ms,
+        )
 
 
 @attr.s(frozen=True, slots=True, auto_attribs=True)

@@ -67,7 +67,7 @@ The loop continues so long as there is anything to send. At each iteration of th
 
 When the `PerDestinationQueue` has the catch-up flag set, the *Catch-Up Transmission Loop*
 (`_catch_up_transmission_loop`) is used in lieu of the regular `_transaction_transmission_loop`.
-(Only once the catch-up mode has been exited can the regular tranaction transmission behaviour
+(Only once the catch-up mode has been exited can the regular transaction transmission behaviour
 be resumed.)
 
 *Catch-Up Mode*, entered upon Synapse startup or once a homeserver has fallen behind due to
@@ -581,14 +581,14 @@ class FederationSender(AbstractFederationSender):
                                 "get_joined_hosts", str(sg)
                             )
                             if destinations is None:
-                                # Add logging to help track down #13444
+                                # Add logging to help track down https://github.com/matrix-org/synapse/issues/13444
                                 logger.info(
                                     "Unexpectedly did not have cached destinations for %s / %s",
                                     sg,
                                     event.event_id,
                                 )
                         else:
-                            # Add logging to help track down #13444
+                            # Add logging to help track down https://github.com/matrix-org/synapse/issues/13444
                             logger.info(
                                 "Unexpectedly did not have cached prev group for %s",
                                 event.event_id,
@@ -844,7 +844,7 @@ class FederationSender(AbstractFederationSender):
         destinations (list[str])
         """
 
-        if not states or not self.hs.config.server.use_presence:
+        if not states or not self.hs.config.server.track_presence:
             # No-op if presence is disabled.
             return
 

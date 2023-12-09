@@ -24,6 +24,7 @@ from typing import (
     Dict,
     Iterable,
     List,
+    Mapping,
     MutableMapping,
     Optional,
     Set,
@@ -1311,7 +1312,8 @@ class EventsWorkerStore(SQLBaseStore):
             room_version: Optional[RoomVersion]
             if not room_version_id:
                 # this should only happen for out-of-band membership events which
-                # arrived before #6983 landed. For all other events, we should have
+                # arrived before https://github.com/matrix-org/synapse/issues/6983
+                # landed. For all other events, we should have
                 # an entry in the 'rooms' table.
                 #
                 # However, the 'out_of_band_membership' flag is unreliable for older
@@ -1322,7 +1324,8 @@ class EventsWorkerStore(SQLBaseStore):
                         "Room %s for event %s is unknown" % (d["room_id"], event_id)
                     )
 
-                # so, assuming this is an out-of-band-invite that arrived before #6983
+                # so, assuming this is an out-of-band-invite that arrived before
+                # https://github.com/matrix-org/synapse/issues/6983
                 # landed, we know that the room version must be v5 or earlier (because
                 # v6 hadn't been invented at that point, so invites from such rooms
                 # would have been rejected.)
@@ -1583,16 +1586,19 @@ class EventsWorkerStore(SQLBaseStore):
         """Given a list of event ids, check if we have already processed and
         stored them as non outliers.
         """
-        rows = await self.db_pool.simple_select_many_batch(
-            table="events",
-            retcols=("event_id",),
-            column="event_id",
-            iterable=list(event_ids),
-            keyvalues={"outlier": False},
-            desc="have_events_in_timeline",
+        rows = cast(
+            List[Tuple[str]],
+            await self.db_pool.simple_select_many_batch(
+                table="events",
+                retcols=("event_id",),
+                column="event_id",
+                iterable=list(event_ids),
+                keyvalues={"outlier": False},
+                desc="have_events_in_timeline",
+            ),
         )
 
-        return {r["event_id"] for r in rows}
+        return {r[0] for r in rows}
 
     @trace
     @tag_args
@@ -1633,7 +1639,7 @@ class EventsWorkerStore(SQLBaseStore):
         self,
         room_id: str,
         event_ids: Collection[str],
-    ) -> Dict[str, bool]:
+    ) -> Mapping[str, bool]:
         """Helper for have_seen_events
 
         Returns:
@@ -1994,7 +2000,7 @@ class EventsWorkerStore(SQLBaseStore):
         if not res:
             raise SynapseError(404, "Could not find event %s" % (event_id,))
 
-        return int(res["topological_ordering"]), int(res["stream_ordering"])
+        return int(res[0]), int(res[1])
 
     async def get_next_event_to_expire(self) -> Optional[Tuple[str, int]]:
         """Retrieve the entry with the lowest expiry timestamp in the event_expiry
@@ -2091,12 +2097,6 @@ class EventsWorkerStore(SQLBaseStore):
 
         def _cleanup_old_transaction_ids_txn(txn: LoggingTransaction) -> None:
             one_day_ago = self._clock.time_msec() - 24 * 60 * 60 * 1000
-            sql = """
-                DELETE FROM event_txn_id
-                WHERE inserted_ts < ?
-            """
-            txn.execute(sql, (one_day_ago,))
-
             sql = """
                 DELETE FROM event_txn_id_device_id
                 WHERE inserted_ts < ?
@@ -2325,7 +2325,7 @@ class EventsWorkerStore(SQLBaseStore):
     @cachedList(cached_method_name="is_partial_state_event", list_name="event_ids")
     async def get_partial_state_events(
         self, event_ids: Collection[str]
-    ) -> Dict[str, bool]:
+    ) -> Mapping[str, bool]:
         """Checks which of the given events have partial state
 
         Args:
@@ -2335,15 +2335,18 @@ class EventsWorkerStore(SQLBaseStore):
             a dict mapping from event id to partial-stateness. We return True for
             any of the events which are unknown (or are outliers).
         """
-        result = await self.db_pool.simple_select_many_batch(
-            table="partial_state_events",
-            column="event_id",
-            iterable=event_ids,
-            retcols=["event_id"],
-            desc="get_partial_state_events",
+        result = cast(
+            List[Tuple[str]],
+            await self.db_pool.simple_select_many_batch(
+                table="partial_state_events",
+                column="event_id",
+                iterable=event_ids,
+                retcols=["event_id"],
+                desc="get_partial_state_events",
+            ),
         )
         # convert the result to a dict, to make @cachedList work
-        partial = {r["event_id"] for r in result}
+        partial = {r[0] for r in result}
         return {e_id: e_id in partial for e_id in event_ids}
 
     @cached()

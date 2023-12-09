@@ -15,7 +15,13 @@
 import logging
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
-from pydantic import StrictStr
+from synapse._pydantic_compat import HAS_PYDANTIC_V2
+
+if TYPE_CHECKING or HAS_PYDANTIC_V2:
+    from pydantic.v1 import StrictStr
+else:
+    from pydantic import StrictStr
+
 from typing_extensions import Literal
 
 from twisted.web.server import Request
@@ -141,7 +147,7 @@ class ClientDirectoryListServer(RestServlet):
         if room is None:
             raise NotFoundError("Unknown room")
 
-        return 200, {"visibility": "public" if room["is_public"] else "private"}
+        return 200, {"visibility": "public" if room[0] else "private"}
 
     class PutBody(RequestBodyModel):
         visibility: Literal["public", "private"] = "public"

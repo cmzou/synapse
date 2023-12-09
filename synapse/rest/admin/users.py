@@ -18,6 +18,8 @@ import secrets
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
+import attr
+
 from synapse.api.constants import Direction, UserTypes
 from synapse.api.errors import Codes, NotFoundError, SynapseError
 from synapse.http.servlet import (
@@ -39,7 +41,7 @@ from synapse.rest.admin._base import (
 from synapse.rest.client._base import client_patterns
 from synapse.storage.databases.main.registration import ExternalIDReuseException
 from synapse.storage.databases.main.stats import UserSortOrder
-from synapse.types import JsonDict, UserID
+from synapse.types import JsonDict, JsonMapping, UserID
 
 if TYPE_CHECKING:
     from synapse.server import HomeServer
@@ -66,6 +68,7 @@ class UsersRestServletV2(RestServlet):
     The parameter `deactivated` can be used to include deactivated users.
     The parameter `order_by` can be used to order the result.
     The parameter `not_user_type` can be used to exclude certain user types.
+    The parameter `locked` can be used to include locked users.
     Possible values are `bot`, `support` or "empty string".
     "empty string" here means to exclude users without a type.
     """
@@ -107,8 +110,9 @@ class UsersRestServletV2(RestServlet):
                 "The guests parameter is not supported when MSC3861 is enabled.",
                 errcode=Codes.INVALID_PARAM,
             )
-        deactivated = parse_boolean(request, "deactivated", default=False)
 
+        deactivated = parse_boolean(request, "deactivated", default=False)
+        locked = parse_boolean(request, "locked", default=False)
         admins = parse_boolean(request, "admins")
 
         # If support for MSC3866 is not enabled, apply no filtering based on the
@@ -133,6 +137,7 @@ class UsersRestServletV2(RestServlet):
                 UserSortOrder.SHADOW_BANNED.value,
                 UserSortOrder.CREATION_TS.value,
                 UserSortOrder.LAST_SEEN_TS.value,
+                UserSortOrder.LOCKED.value,
             ),
         )
 
@@ -154,14 +159,17 @@ class UsersRestServletV2(RestServlet):
             direction,
             approved,
             not_user_types,
+            locked,
         )
 
         # If support for MSC3866 is not enabled, don't show the approval flag.
+        filter = None
         if not self._msc3866_enabled:
-            for user in users:
-                del user["approved"]
 
-        ret = {"users": users, "total": total}
+            def _filter(a: attr.Attribute) -> bool:
+                return a.name != "approved"
+
+        ret = {"users": [attr.asdict(u, filter=filter) for u in users], "total": total}
         if (start + limit) < total:
             ret["next_token"] = str(start + len(users))
 
@@ -211,7 +219,7 @@ class UserRestServletV2(RestServlet):
 
     async def on_GET(
         self, request: SynapseRequest, user_id: str
-    ) -> Tuple[int, JsonDict]:
+    ) -> Tuple[int, JsonMapping]:
         await assert_requester_is_admin(self.auth, request)
 
         target_user = UserID.from_string(user_id)
@@ -226,7 +234,7 @@ class UserRestServletV2(RestServlet):
 
     async def on_PUT(
         self, request: SynapseRequest, user_id: str
-    ) -> Tuple[int, JsonDict]:
+    ) -> Tuple[int, JsonMapping]:
         requester = await self.auth.get_user_by_req(request)
         await assert_user_is_admin(self.auth, requester)
 
@@ -325,9 +333,8 @@ class UserRestServletV2(RestServlet):
 
             if threepids is not None:
                 # get changed threepids (added and removed)
-                # convert List[Dict[str, Any]] into Set[Tuple[str, str]]
                 cur_threepids = {
-                    (threepid["medium"], threepid["address"])
+                    (threepid.medium, threepid.address)
                     for threepid in await self.store.user_get_threepids(user_id)
                 }
                 add_threepids = new_threepids - cur_threepids
@@ -623,6 +630,12 @@ class UserRegisterServlet(RestServlet):
         if not hmac.compare_digest(want_mac.encode("ascii"), got_mac.encode("ascii")):
             raise SynapseError(HTTPStatus.FORBIDDEN, "HMAC incorrect")
 
+        should_issue_refresh_token = body.get("refresh_token", False)
+        if not isinstance(should_issue_refresh_token, bool):
+            raise SynapseError(
+                HTTPStatus.BAD_REQUEST, "refresh_token must be a boolean"
+            )
+
         # Reuse the parts of RegisterRestServlet to reduce code duplication
         from synapse.rest.client.register import RegisterRestServlet
 
@@ -638,7 +651,9 @@ class UserRegisterServlet(RestServlet):
             approved=True,
         )
 
-        result = await register._create_registration_details(user_id, body)
+        result = await register._create_registration_details(
+            user_id, body, should_issue_refresh_token=should_issue_refresh_token
+        )
         return HTTPStatus.OK, result
 
 
@@ -658,7 +673,7 @@ class WhoisRestServlet(RestServlet):
 
     async def on_GET(
         self, request: SynapseRequest, user_id: str
-    ) -> Tuple[int, JsonDict]:
+    ) -> Tuple[int, JsonMapping]:
         target_user = UserID.from_string(user_id)
         requester = await self.auth.get_user_by_req(request)
 
@@ -838,7 +853,18 @@ class SearchUsersRestServlet(RestServlet):
         logger.info("term: %s ", term)
 
         ret = await self.store.search_users(term)
-        return HTTPStatus.OK, ret
+        results = [
+            {
+                "name": name,
+                "password_hash": password_hash,
+                "is_guest": bool(is_guest),
+                "admin": bool(admin),
+                "user_type": user_type,
+            }
+            for name, password_hash, is_guest, admin, user_type in ret
+        ]
+
+        return HTTPStatus.OK, results
 
 
 class UserAdminServlet(RestServlet):
@@ -1250,6 +1276,46 @@ class AccountDataRestServlet(RestServlet):
                 "rooms": by_room_data,
             },
         }
+
+
+class UserReplaceMasterCrossSigningKeyRestServlet(RestServlet):
+    """Allow a given user to replace their master cross-signing key without UIA.
+
+    This replacement is permitted for a limited period (currently 10 minutes).
+
+    While this is exposed via the admin API, this is intended for use by the
+    Matrix Authentication Service rather than server admins.
+    """
+
+    PATTERNS = admin_patterns(
+        "/users/(?P<user_id>[^/]*)/_allow_cross_signing_replacement_without_uia"
+    )
+    REPLACEMENT_PERIOD_MS = 10 * 60 * 1000  # 10 minutes
+
+    def __init__(self, hs: "HomeServer"):
+        self._auth = hs.get_auth()
+        self._store = hs.get_datastores().main
+
+    async def on_POST(
+        self,
+        request: SynapseRequest,
+        user_id: str,
+    ) -> Tuple[int, JsonDict]:
+        await assert_requester_is_admin(self._auth, request)
+
+        if user_id is None:
+            raise NotFoundError("User not found")
+
+        timestamp = (
+            await self._store.allow_master_cross_signing_key_replacement_without_uia(
+                user_id, self.REPLACEMENT_PERIOD_MS
+            )
+        )
+
+        if timestamp is None:
+            raise NotFoundError("User has no master cross-signing key")
+
+        return HTTPStatus.OK, {"updatable_without_uia_before_ms": timestamp}
 
 
 class UserByExternalId(RestServlet):

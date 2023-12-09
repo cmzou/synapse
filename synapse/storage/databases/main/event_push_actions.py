@@ -182,6 +182,7 @@ class UserPushAction(EmailPushAction):
     profile_tag: str
 
 
+# TODO This is used as a cached value and is mutable.
 @attr.s(slots=True, auto_attribs=True)
 class NotifCounts:
     """
@@ -193,7 +194,7 @@ class NotifCounts:
     highlight_count: int = 0
 
 
-@attr.s(slots=True, auto_attribs=True)
+@attr.s(slots=True, frozen=True, auto_attribs=True)
 class RoomNotifCounts:
     """
     The per-user, per-room count of notifications. Used by sync and push.
@@ -201,7 +202,7 @@ class RoomNotifCounts:
 
     main_timeline: NotifCounts
     # Map of thread ID to the notification counts.
-    threads: Dict[str, NotifCounts]
+    threads: Mapping[str, NotifCounts]
 
     @staticmethod
     def empty() -> "RoomNotifCounts":
@@ -308,6 +309,14 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
         self.db_pool.updates.register_background_update_handler(
             "event_push_drop_null_thread_id_indexes",
             self._background_drop_null_thread_id_indexes,
+        )
+
+        # Add a room ID index to speed up room deletion
+        self.db_pool.updates.register_background_index_update(
+            "event_push_summary_index_room_id",
+            index_name="event_push_summary_index_room_id",
+            table="event_push_summary",
+            columns=["room_id"],
         )
 
     async def _background_drop_null_thread_id_indexes(
@@ -483,7 +492,7 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
 
         return room_to_count
 
-    @cached(tree=True, max_entries=5000, iterable=True)
+    @cached(tree=True, max_entries=5000, iterable=True)  # type: ignore[synapse-@cached-mutable]
     async def get_unread_event_push_actions_by_room_for_user(
         self,
         room_id: str,
@@ -1599,10 +1608,7 @@ class EventPushActionsWorkerStore(ReceiptsWorkerStore, StreamWorkerStore, SQLBas
             txn,
             table="event_push_summary",
             key_names=("user_id", "room_id", "thread_id"),
-            key_values=[
-                (user_id, room_id, thread_id)
-                for user_id, room_id, thread_id in summaries
-            ],
+            key_values=list(summaries),
             value_names=("notif_count", "unread_count", "stream_ordering"),
             value_values=[
                 (

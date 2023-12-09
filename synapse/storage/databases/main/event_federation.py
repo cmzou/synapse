@@ -19,6 +19,7 @@ from typing import (
     TYPE_CHECKING,
     Collection,
     Dict,
+    FrozenSet,
     Iterable,
     List,
     Optional,
@@ -47,7 +48,7 @@ from synapse.storage.database import (
 from synapse.storage.databases.main.events_worker import EventsWorkerStore
 from synapse.storage.databases.main.signatures import SignatureWorkerStore
 from synapse.storage.engines import PostgresEngine, Sqlite3Engine
-from synapse.types import JsonDict, StrCollection, StrSequence
+from synapse.types import JsonDict, StrCollection
 from synapse.util import json_encoder
 from synapse.util.caches.descriptors import cached
 from synapse.util.caches.lrucache import LruCache
@@ -192,7 +193,8 @@ class EventFederationWorkerStore(SignatureWorkerStore, EventsWorkerStore, SQLBas
         # Check if we have indexed the room so we can use the chain cover
         # algorithm.
         room = await self.get_room(room_id)  # type: ignore[attr-defined]
-        if room["has_auth_chain_index"]:
+        # If the room has an auth chain index.
+        if room[1]:
             try:
                 return await self.db_pool.runInteraction(
                     "get_auth_chain_ids_chains",
@@ -299,6 +301,11 @@ class EventFederationWorkerStore(SignatureWorkerStore, EventsWorkerStore, SQLBas
         # Add the initial set of chains, excluding the sequence corresponding to
         # initial event.
         for chain_id, seq_no in event_chains.items():
+            # Check if the initial event is the first item in the chain. If so, then
+            # there is nothing new to add from this chain.
+            if seq_no == 1:
+                continue
+
             chains[chain_id] = max(seq_no - 1, chains.get(chain_id, 0))
 
         # Now for each chain we figure out the maximum sequence number reachable
@@ -410,7 +417,8 @@ class EventFederationWorkerStore(SignatureWorkerStore, EventsWorkerStore, SQLBas
         # Check if we have indexed the room so we can use the chain cover
         # algorithm.
         room = await self.get_room(room_id)  # type: ignore[attr-defined]
-        if room["has_auth_chain_index"]:
+        # If the room has an auth chain index.
+        if room[1]:
             try:
                 return await self.db_pool.runInteraction(
                     "get_auth_chain_difference_chains",
@@ -1048,15 +1056,18 @@ class EventFederationWorkerStore(SignatureWorkerStore, EventsWorkerStore, SQLBas
         Args:
             event_ids: The event IDs to calculate the max depth of.
         """
-        rows = await self.db_pool.simple_select_many_batch(
-            table="events",
-            column="event_id",
-            iterable=event_ids,
-            retcols=(
-                "event_id",
-                "depth",
+        rows = cast(
+            List[Tuple[str, int]],
+            await self.db_pool.simple_select_many_batch(
+                table="events",
+                column="event_id",
+                iterable=event_ids,
+                retcols=(
+                    "event_id",
+                    "depth",
+                ),
+                desc="get_max_depth_of",
             ),
-            desc="get_max_depth_of",
         )
 
         if not rows:
@@ -1064,10 +1075,10 @@ class EventFederationWorkerStore(SignatureWorkerStore, EventsWorkerStore, SQLBas
         else:
             max_depth_event_id = ""
             current_max_depth = 0
-            for row in rows:
-                if row["depth"] > current_max_depth:
-                    max_depth_event_id = row["event_id"]
-                    current_max_depth = row["depth"]
+            for event_id, depth in rows:
+                if depth > current_max_depth:
+                    max_depth_event_id = event_id
+                    current_max_depth = depth
 
             return max_depth_event_id, current_max_depth
 
@@ -1077,15 +1088,18 @@ class EventFederationWorkerStore(SignatureWorkerStore, EventsWorkerStore, SQLBas
         Args:
             event_ids: The event IDs to calculate the max depth of.
         """
-        rows = await self.db_pool.simple_select_many_batch(
-            table="events",
-            column="event_id",
-            iterable=event_ids,
-            retcols=(
-                "event_id",
-                "depth",
+        rows = cast(
+            List[Tuple[str, int]],
+            await self.db_pool.simple_select_many_batch(
+                table="events",
+                column="event_id",
+                iterable=event_ids,
+                retcols=(
+                    "event_id",
+                    "depth",
+                ),
+                desc="get_min_depth_of",
             ),
-            desc="get_min_depth_of",
         )
 
         if not rows:
@@ -1093,10 +1107,10 @@ class EventFederationWorkerStore(SignatureWorkerStore, EventsWorkerStore, SQLBas
         else:
             min_depth_event_id = ""
             current_min_depth = MAX_DEPTH
-            for row in rows:
-                if row["depth"] < current_min_depth:
-                    min_depth_event_id = row["event_id"]
-                    current_min_depth = row["depth"]
+            for event_id, depth in rows:
+                if depth < current_min_depth:
+                    min_depth_event_id = event_id
+                    current_min_depth = depth
 
             return min_depth_event_id, current_min_depth
 
@@ -1179,13 +1193,14 @@ class EventFederationWorkerStore(SignatureWorkerStore, EventsWorkerStore, SQLBas
         )
 
     @cached(max_entries=5000, iterable=True)
-    async def get_latest_event_ids_in_room(self, room_id: str) -> StrSequence:
-        return await self.db_pool.simple_select_onecol(
+    async def get_latest_event_ids_in_room(self, room_id: str) -> FrozenSet[str]:
+        event_ids = await self.db_pool.simple_select_onecol(
             table="event_forward_extremities",
             keyvalues={"room_id": room_id},
             retcol="event_id",
             desc="get_latest_event_ids_in_room",
         )
+        return frozenset(event_ids)
 
     async def get_min_depth(self, room_id: str) -> Optional[int]:
         """For the given room, get the minimum depth we have seen for it."""
@@ -1429,24 +1444,18 @@ class EventFederationWorkerStore(SignatureWorkerStore, EventsWorkerStore, SQLBas
             )
 
             if event_lookup_result is not None:
+                event_type, depth, stream_ordering = event_lookup_result
                 logger.debug(
                     "_get_backfill_events(room_id=%s): seed_event_id=%s depth=%s stream_ordering=%s type=%s",
                     room_id,
                     seed_event_id,
-                    event_lookup_result["depth"],
-                    event_lookup_result["stream_ordering"],
-                    event_lookup_result["type"],
+                    depth,
+                    stream_ordering,
+                    event_type,
                 )
 
-                if event_lookup_result["depth"]:
-                    queue.put(
-                        (
-                            -event_lookup_result["depth"],
-                            -event_lookup_result["stream_ordering"],
-                            seed_event_id,
-                            event_lookup_result["type"],
-                        )
-                    )
+                if depth:
+                    queue.put((-depth, -stream_ordering, seed_event_id, event_type))
 
         while not queue.empty() and len(event_id_results) < limit:
             try:
@@ -1551,19 +1560,18 @@ class EventFederationWorkerStore(SignatureWorkerStore, EventsWorkerStore, SQLBas
             A filtered down list of `event_ids` that have previous failed pull attempts.
         """
 
-        rows = await self.db_pool.simple_select_many_batch(
-            table="event_failed_pull_attempts",
-            column="event_id",
-            iterable=event_ids,
-            keyvalues={},
-            retcols=("event_id",),
-            desc="get_event_ids_with_failed_pull_attempts",
+        rows = cast(
+            List[Tuple[str]],
+            await self.db_pool.simple_select_many_batch(
+                table="event_failed_pull_attempts",
+                column="event_id",
+                iterable=event_ids,
+                keyvalues={},
+                retcols=("event_id",),
+                desc="get_event_ids_with_failed_pull_attempts",
+            ),
         )
-        event_ids_with_failed_pull_attempts: Set[str] = {
-            row["event_id"] for row in rows
-        }
-
-        return event_ids_with_failed_pull_attempts
+        return {row[0] for row in rows}
 
     @trace
     async def get_event_ids_to_not_pull_from_backoff(
@@ -1583,32 +1591,34 @@ class EventFederationWorkerStore(SignatureWorkerStore, EventsWorkerStore, SQLBas
             A dictionary of event_ids that should not be attempted to be pulled and the
             next timestamp at which we may try pulling them again.
         """
-        event_failed_pull_attempts = await self.db_pool.simple_select_many_batch(
-            table="event_failed_pull_attempts",
-            column="event_id",
-            iterable=event_ids,
-            keyvalues={},
-            retcols=(
-                "event_id",
-                "last_attempt_ts",
-                "num_attempts",
+        event_failed_pull_attempts = cast(
+            List[Tuple[str, int, int]],
+            await self.db_pool.simple_select_many_batch(
+                table="event_failed_pull_attempts",
+                column="event_id",
+                iterable=event_ids,
+                keyvalues={},
+                retcols=(
+                    "event_id",
+                    "last_attempt_ts",
+                    "num_attempts",
+                ),
+                desc="get_event_ids_to_not_pull_from_backoff",
             ),
-            desc="get_event_ids_to_not_pull_from_backoff",
         )
 
         current_time = self._clock.time_msec()
 
         event_ids_with_backoff = {}
-        for event_failed_pull_attempt in event_failed_pull_attempts:
-            event_id = event_failed_pull_attempt["event_id"]
+        for event_id, last_attempt_ts, num_attempts in event_failed_pull_attempts:
             # Exponential back-off (up to the upper bound) so we don't try to
             # pull the same event over and over. ex. 2hr, 4hr, 8hr, 16hr, etc.
             backoff_end_time = (
-                event_failed_pull_attempt["last_attempt_ts"]
+                last_attempt_ts
                 + (
                     2
                     ** min(
-                        event_failed_pull_attempt["num_attempts"],
+                        num_attempts,
                         BACKFILL_EVENT_EXPONENTIAL_BACKOFF_MAXIMUM_DOUBLING_STEPS,
                     )
                 )
@@ -1889,21 +1899,23 @@ class EventFederationWorkerStore(SignatureWorkerStore, EventsWorkerStore, SQLBas
         # keeping only the forward extremities (i.e. the events not referenced
         # by other events in the queue). We do this so that we can always
         # backpaginate in all the events we have dropped.
-        rows = await self.db_pool.simple_select_list(
-            table="federation_inbound_events_staging",
-            keyvalues={"room_id": room_id},
-            retcols=("event_id", "event_json"),
-            desc="prune_staged_events_in_room_fetch",
+        rows = cast(
+            List[Tuple[str, str]],
+            await self.db_pool.simple_select_list(
+                table="federation_inbound_events_staging",
+                keyvalues={"room_id": room_id},
+                retcols=("event_id", "event_json"),
+                desc="prune_staged_events_in_room_fetch",
+            ),
         )
 
         # Find the set of events referenced by those in the queue, as well as
         # collecting all the event IDs in the queue.
         referenced_events: Set[str] = set()
         seen_events: Set[str] = set()
-        for row in rows:
-            event_id = row["event_id"]
+        for event_id, event_json in rows:
             seen_events.add(event_id)
-            event_d = db_to_json(row["event_json"])
+            event_d = db_to_json(event_json)
 
             # We don't bother parsing the dicts into full blown event objects,
             # as that is needlessly expensive.
